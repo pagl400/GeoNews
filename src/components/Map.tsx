@@ -2,6 +2,11 @@ import React, { useEffect, useRef, useState } from 'react';
 import { MapContainer, TileLayer, Marker, Popup, useMap, GeoJSON } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
+import MarkerClusterGroup from 'react-leaflet-cluster';
+
+// Import MarkerCluster CSS
+import 'leaflet.markercluster/dist/MarkerCluster.css';
+import 'leaflet.markercluster/dist/MarkerCluster.Default.css';
 
 // Fix for leaflet.heat - it expects L to be globally available
 (window as any).L = L;
@@ -11,15 +16,21 @@ import { NewsItem } from '../types';
 
 // Fix for default marker icons in Leaflet with React
 import icon from 'leaflet/dist/images/marker-icon.png';
+import iconRetina from 'leaflet/dist/images/marker-icon-2x.png';
 import iconShadow from 'leaflet/dist/images/marker-shadow.png';
 
-let DefaultIcon = L.icon({
+const DefaultIcon = L.icon({
     iconUrl: icon,
+    iconRetinaUrl: iconRetina,
     shadowUrl: iconShadow,
     iconSize: [25, 41],
-    iconAnchor: [12, 41]
+    iconAnchor: [12, 41],
+    popupAnchor: [1, -34],
+    tooltipAnchor: [16, -28],
+    shadowSize: [41, 41]
 });
 
+// Set the default icon for all markers globally as a fallback
 L.Marker.prototype.options.icon = DefaultIcon;
 
 interface MapProps {
@@ -114,6 +125,16 @@ const Map: React.FC<MapProps> = ({ news, onMarkerClick, selectedNewsId, showMark
   const selectedNews = news.find(n => n.id === selectedNewsId);
   const [geoData, setGeoData] = useState<any>(null);
 
+  useEffect(() => {
+    console.log(`[MAP] Rendering with ${news.length} news items. showMarkers: ${showMarkers}`);
+    if (news.length > 0) {
+      const invalidCoords = news.filter(n => isNaN(n.lat) || isNaN(n.lng));
+      if (invalidCoords.length > 0) {
+        console.warn(`[MAP] Found ${invalidCoords.length} items with invalid coordinates:`, invalidCoords);
+      }
+    }
+  }, [news, showMarkers]);
+
   // Fetch country GeoJSON
   useEffect(() => {
     fetch('https://raw.githubusercontent.com/johan/world.geo.json/master/countries.geo.json')
@@ -176,41 +197,60 @@ const Map: React.FC<MapProps> = ({ news, onMarkerClick, selectedNewsId, showMark
           />
         )}
 
-        {showMarkers && news.map((item) => (
-          <Marker 
-            key={item.id} 
-            position={[item.lat, item.lng]}
-            eventHandlers={{
-              click: () => onMarkerClick(item),
-            }}
+        {showMarkers && (
+          <MarkerClusterGroup
+            chunkedLoading
+            maxClusterRadius={50}
+            spiderfyOnMaxZoom={true}
+            showCoverageOnHover={false}
           >
-            <Popup>
-              <div className="p-1 max-w-[200px] text-zinc-900">
-                <h3 className="m-0 mb-1 text-sm font-bold leading-tight">{item.title}</h3>
-                {(item.locationName || item.countryName) && (
-                  <p className="m-0 mb-1 text-[10px] font-bold text-orange-600 uppercase tracking-wider">
-                    {item.locationName && item.locationName !== 'Global' ? (
-                      (item.countryName && item.countryName !== 'Global' && !item.locationName.includes(item.countryName)) 
-                        ? `${item.locationName}, ${item.countryName}` 
-                        : item.locationName
-                    ) : (
-                      (item.countryName && item.countryName !== 'Global') ? item.countryName : 'Global'
+            {news.map((item) => (
+              <Marker 
+                key={item.id} 
+                position={[item.lat, item.lng]}
+                icon={DefaultIcon}
+                eventHandlers={{
+                  click: () => onMarkerClick(item),
+                }}
+              >
+                <Popup>
+                  <div className="p-1 max-w-[200px] text-zinc-900">
+                    <h3 className="m-0 mb-1 text-sm font-bold leading-tight">{item.title}</h3>
+                    {(item.locationName || item.countryName) && (
+                      <p className="m-0 mb-1 text-[10px] font-bold text-orange-600 uppercase tracking-wider">
+                        {item.locationName && item.locationName !== 'Global' ? (
+                          (item.countryName && item.countryName !== 'Global' && !item.locationName.includes(item.countryName)) 
+                            ? `${item.locationName}, ${item.countryName}` 
+                            : item.locationName
+                        ) : (
+                          (item.countryName && item.countryName !== 'Global') ? item.countryName : 'Global'
+                        )}
+                      </p>
                     )}
-                  </p>
-                )}
-                <p className="m-0 mb-2 text-xs text-zinc-600">{item.source} • {new Date(item.pubDate).toLocaleDateString()}</p>
-                <a 
-                  href={item.link} 
-                  target="_blank" 
-                  rel="noopener noreferrer"
-                  className="text-orange-600 text-xs font-bold no-underline hover:underline"
-                >
-                  Read Full Article →
-                </a>
-              </div>
-            </Popup>
-          </Marker>
-        ))}
+                    <p className="m-0 mb-2 text-xs text-zinc-600">
+                      {item.source} • {(() => {
+                        try {
+                          const date = new Date(item.pubDate);
+                          return isNaN(date.getTime()) ? 'Recent' : date.toLocaleDateString();
+                        } catch (e) {
+                          return 'Recent';
+                        }
+                      })()}
+                    </p>
+                    <a 
+                      href={item.link} 
+                      target="_blank" 
+                      rel="noopener noreferrer"
+                      className="text-orange-600 text-xs font-bold no-underline hover:underline"
+                    >
+                      Read Full Article →
+                    </a>
+                  </div>
+                </Popup>
+              </Marker>
+            ))}
+          </MarkerClusterGroup>
+        )}
 
         <MapController 
           selectedNews={selectedNews} 

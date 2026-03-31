@@ -36,11 +36,6 @@ const NewsFeed: React.FC<NewsFeedProps> = ({ news, onItemClick, selectedNewsId }
               <div className="flex justify-between items-start gap-4">
                 <div className="flex-1">
                   <h3 className="text-zinc-200 text-sm font-medium leading-tight mb-2">
-                    {item.locationName && item.locationName !== 'Global' && (
-                      <span className="text-orange-500 font-bold mr-1.5 uppercase text-[11px]">
-                        [{item.locationName}]
-                      </span>
-                    )}
                     {item.title}
                   </h3>
                   <div className="flex flex-wrap items-center gap-3 text-[10px] text-zinc-500 uppercase tracking-wider font-semibold">
@@ -55,7 +50,16 @@ const NewsFeed: React.FC<NewsFeedProps> = ({ news, onItemClick, selectedNewsId }
                         (item.countryName && item.countryName !== 'Global') ? item.countryName : 'Global'
                       )}
                     </span>
-                    <span>{formatDistanceToNow(new Date(item.pubDate), { addSuffix: true })}</span>
+                    <span>
+                      {(() => {
+                        try {
+                          const date = new Date(item.pubDate);
+                          return isNaN(date.getTime()) ? 'Recently' : formatDistanceToNow(date, { addSuffix: true });
+                        } catch (e) {
+                          return 'Recently';
+                        }
+                      })()}
+                    </span>
                   </div>
                 </div>
                 <a

@@ -10,6 +10,14 @@ import Database from "better-sqlite3";
 const PORT = 3000;
 const DB_FILE = path.join(process.cwd(), "news.db");
 const CACHE_FILE = path.join(process.cwd(), "news_cache.json");
+const LOG_LEVEL: string = 'debug';
+
+const logger = {
+  debug: (msg: string, ...args: any[]) => { if (LOG_LEVEL === 'debug') console.log(`[DEBUG] ${msg}`, ...args); },
+  info: (msg: string, ...args: any[]) => { if (LOG_LEVEL === 'debug' || LOG_LEVEL === 'info') console.log(`[INFO] ${msg}`, ...args); },
+  warn: (msg: string, ...args: any[]) => { if (LOG_LEVEL !== 'error') console.warn(`[WARN] ${msg}`, ...args); },
+  error: (msg: string, ...args: any[]) => { console.error(`[ERROR] ${msg}`, ...args); },
+};
 
 async function startServer() {
   const app = express();
@@ -56,7 +64,7 @@ async function startServer() {
   try {
     const data = await fs.readFile(CACHE_FILE, "utf-8");
     const news = JSON.parse(data);
-    console.log(`Migrating ${news.length} items from JSON cache to SQLite...`);
+    logger.info(`Migrating ${news.length} items from JSON cache to SQLite...`);
     
     const insert = db.prepare(`
       INSERT OR IGNORE INTO news (id, title, link, pubDate, source, lat, lng, timestamp, locationName, countryCode, countryName)
@@ -83,7 +91,7 @@ async function startServer() {
     
     transaction(news);
     await fs.unlink(CACHE_FILE);
-    console.log("Migration complete. JSON cache deleted.");
+    logger.info("Migration complete. JSON cache deleted.");
   } catch (error) {
     // If file doesn't exist, ignore
   }
@@ -94,7 +102,7 @@ async function startServer() {
       const news = db.prepare("SELECT * FROM news ORDER BY timestamp DESC LIMIT 5000").all();
       res.json(news);
     } catch (error) {
-      console.error("Error reading database:", error);
+      logger.error("Error reading database:", error);
       res.status(500).json({ error: "Failed to read news database" });
     }
   });
@@ -133,8 +141,19 @@ async function startServer() {
       const added = transaction(newItems);
       res.json({ success: true, added });
     } catch (error) {
-      console.error("Error updating database:", error);
+      logger.error("Error updating database:", error);
       res.status(500).json({ error: "Failed to update news database" });
+    }
+  });
+
+  app.post("/api/news/flush", (req, res) => {
+    try {
+      db.prepare("DELETE FROM news").run();
+      logger.info("Database flushed.");
+      res.json({ success: true });
+    } catch (error) {
+      logger.error("Error flushing database:", error);
+      res.status(500).json({ error: "Failed to flush news database" });
     }
   });
 
@@ -156,21 +175,33 @@ async function startServer() {
           const result = await parseStringPromise(response.data);
           const channel = result?.rss?.channel?.[0];
           if (!channel || !channel.item) {
-            console.warn(`No items found for ${source.name}`);
+            logger.warn(`No items found for ${source.name}`);
             return [];
           }
 
-          const items = channel.item.map((item: any) => ({
-            id: item.guid?.[0]?._ || item.guid?.[0] || item.link?.[0],
-            title: item.title?.[0] || "No Title",
-            description: item.description?.[0] || "",
-            link: item.link?.[0] || "#",
-            pubDate: item.pubDate?.[0] || new Date().toUTCString(),
-            source: source.name
-          })).filter((item: any) => item.title !== "No Title");
+          const items = channel.item.map((item: any) => {
+            // Extract potential location info from various RSS extensions
+            const georss = item['georss:point']?.[0];
+            const geoLat = item['geo:lat']?.[0];
+            const geoLong = item['geo:long']?.[0];
+            const rssLocation = item['location']?.[0];
+            
+            return {
+              id: item.guid?.[0]?._ || item.guid?.[0] || item.link?.[0],
+              title: item.title?.[0] || "No Title",
+              description: item.description?.[0] || "",
+              link: item.link?.[0] || "#",
+              pubDate: item.pubDate?.[0] || new Date().toUTCString(),
+              source: source.name,
+              categories: item.category ? item.category.map((c: any) => typeof c === 'string' ? c : c._ || c.term).filter(Boolean) : [],
+              rssLocation: rssLocation || null,
+              geoPoint: georss ? { lat: parseFloat(georss.split(' ')[0]), lng: parseFloat(georss.split(' ')[1]) } : 
+                        (geoLat && geoLong ? { lat: parseFloat(geoLat), lng: parseFloat(geoLong) } : null)
+            };
+          }).filter((item: any) => item.title !== "No Title");
           return items;
-        } catch (err) {
-          console.error(`Failed to fetch from ${source.name}:`, err.message);
+        } catch (err: any) {
+          logger.error(`Failed to fetch from ${source.name}:`, err.message);
           return [];
         }
       });
@@ -188,7 +219,7 @@ async function startServer() {
 
       res.json(uniqueItems);
     } catch (error) {
-      console.error("Error fetching RSS feeds:", error);
+      logger.error("Error fetching RSS feeds:", error);
       res.status(500).json({ error: "Failed to fetch news RSS" });
     }
   });
@@ -221,10 +252,10 @@ async function startServer() {
       }
     } catch (error: any) {
       if (error.response) {
-        console.error(`Geocoding error for "${q}": ${error.response.status} ${error.response.statusText}`);
+        logger.error(`Geocoding error for "${q}": ${error.response.status} ${error.response.statusText}`);
         res.status(error.response.status).json({ error: "Geocoding failed" });
       } else {
-        console.error(`Geocoding error for "${q}":`, error.message);
+        logger.error(`Geocoding error for "${q}":`, error.message);
         res.status(500).json({ error: "Geocoding failed" });
       }
     }
@@ -245,7 +276,7 @@ async function startServer() {
   }
 
   httpServer.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+    logger.info(`Server running on http://localhost:${PORT}`);
   });
 }
 

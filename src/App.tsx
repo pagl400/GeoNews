@@ -1,9 +1,19 @@
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useState, useRef, useMemo } from 'react';
 import Map from './components/Map';
 import NewsFeed from './components/NewsFeed';
 import { NewsItem } from './types';
 import { Layers, Map as MapIcon, Filter, Loader2 } from 'lucide-react';
-import { GoogleGenAI, Type } from "@google/genai";
+import { US_STATES, WORLD_CITIES, COUNTRY_MAP } from './constants/locations';
+
+const FALLBACK_COUNTRIES = Object.keys(COUNTRY_MAP);
+
+const CITY_TO_COUNTRY_CODE: Record<string, string> = {
+  ...WORLD_CITIES
+};
+
+const MAJOR_CITIES = Object.keys(WORLD_CITIES);
+
+const ALL_STATES = Object.keys(US_STATES);
 
 export default function App() {
   const [news, setNews] = useState<NewsItem[]>([]);
@@ -22,135 +32,246 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<number>(Date.now());
   const [isProcessing, setIsProcessing] = useState(false);
+  const [processingCount, setProcessingCount] = useState({ current: 0, total: 0 });
+  const [logLevel, setLogLevel] = useState<'debug' | 'error'>('debug');
   const processedIds = useRef<Set<string>>(new Set());
   const processedTitles = useRef<Set<string>>(new Set());
 
-  const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+  const logger = {
+    debug: (msg: string, ...args: any[]) => { if (logLevel === 'debug') console.log(`[DEBUG] ${msg}`, ...args); },
+    info: (msg: string, ...args: any[]) => { if (logLevel === 'debug') console.log(`[INFO] ${msg}`, ...args); },
+    warn: (msg: string, ...args: any[]) => { if (logLevel === 'debug') console.warn(`[WARN] ${msg}`, ...args); },
+    error: (msg: string, ...args: any[]) => { console.error(`[ERROR] ${msg}`, ...args); },
+  };
 
   const processNewsItem = async (rawItem: any) => {
     const normalizedTitle = rawItem.title.trim().toLowerCase();
     if (processedIds.current.has(rawItem.id) || processedTitles.current.has(normalizedTitle)) return null;
     
-    const maxRetries = 3;
-    let retryCount = 0;
-    let locationResult = null;
+    let extractedLocation = null;
+    let countryCode = "";
+    let countryName = "Global";
 
-    while (retryCount <= maxRetries) {
-      try {
-        // 1. Extract location with Gemini
-        locationResult = await ai.models.generateContent({
-          model: "gemini-3-flash-preview",
-          contents: `Extract the most specific geographic location (City, State/Region, Country) mentioned in this news headline and description: 
-          Title: "${rawItem.title}"
-          Description: "${rawItem.description || ''}"
-          
-          If a specific city or region is mentioned, return it in the "location" field. 
-          If ONLY a country is mentioned, return the country name in the "location" field AND the "countryName" field.
-          If no location or country is mentioned at all, return "Global" for both.
-          
-          NEVER return "Global" if a country is mentioned.
-          
-          Also provide the ISO 3166-1 alpha-3 country code AND the full English country name.
-          Return as JSON.`,
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                location: { type: Type.STRING },
-                countryCode: { type: Type.STRING, description: "ISO 3166-1 alpha-3 code" },
-                countryName: { type: Type.STRING, description: "Full country name" }
-              },
-              required: ["location", "countryCode", "countryName"]
-            }
-          }
-        });
-        // If successful, break the retry loop
-        break;
-      } catch (error: any) {
-        const is503 = error?.message?.includes("503") || error?.status === 503 || error?.error?.code === 503;
-        
-        if (is503 && retryCount < maxRetries) {
-          retryCount++;
-          const delay = Math.pow(2, retryCount) * 1000 + Math.random() * 1000;
-          console.warn(`Gemini API busy (503). Retrying in ${Math.round(delay)}ms... (Attempt ${retryCount}/${maxRetries})`);
-          await new Promise(resolve => setTimeout(resolve, delay));
-          continue;
+    // 1. Rule-based extraction (Fast, No AI)
+    const title = rawItem.title;
+    const desc = rawItem.description || "";
+    const combinedText = (title + " " + desc).toLowerCase();
+    const titleLower = title.toLowerCase();
+    const categories = rawItem.categories || [];
+    
+    // 1a. Direct RSS GeoPoint (Best)
+    if (rawItem.geoPoint) {
+      const pubDate = rawItem.pubDate || new Date().toISOString();
+      const dateObj = new Date(pubDate);
+      const timestamp = isNaN(dateObj.getTime()) ? Date.now() : dateObj.getTime();
+
+      const enrichedItem: NewsItem = {
+        ...rawItem,
+        locationName: "Geotagged Location",
+        countryCode: "",
+        countryName: "Global",
+        lat: rawItem.geoPoint.lat,
+        lng: rawItem.geoPoint.lng,
+        timestamp: timestamp
+      };
+      logger.info(`[MATCHED] Direct RSS GeoPoint for "${title}"`);
+      processedIds.current.add(rawItem.id);
+      processedTitles.current.add(normalizedTitle);
+      return enrichedItem;
+    }
+
+    // 1b. Direct RSS Location string
+    if (rawItem.rssLocation) {
+      extractedLocation = rawItem.rssLocation;
+      logger.info(`[MATCHED] Direct RSS Location tag: ${extractedLocation} for "${title}"`);
+    }
+
+    // 1c. Scan TITLE for countries (High Priority)
+    if (!extractedLocation) {
+      for (const country of FALLBACK_COUNTRIES) {
+        const regex = new RegExp(`\\b${country.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+        if (regex.test(titleLower)) {
+          extractedLocation = country;
+          countryName = country;
+          countryCode = COUNTRY_MAP[country] || "";
+          logger.info(`[MATCHED] Rule-based extraction (Country Scan - Title): ${extractedLocation} for "${title}"`);
+          break;
         }
-        
-        console.error("Error processing news item with Gemini:", error);
-        return null; // Give up after retries or if it's not a 503
       }
     }
 
-    if (!locationResult) return null;
+    // 1d. Scan TITLE for major cities (High Priority)
+    if (!extractedLocation) {
+      for (const city of MAJOR_CITIES) {
+        const regex = new RegExp(`\\b${city.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+        if (regex.test(titleLower)) {
+          extractedLocation = city;
+          countryCode = CITY_TO_COUNTRY_CODE[city] || "";
+          logger.info(`[MATCHED] Rule-based extraction (City Scan - Title): ${extractedLocation} for "${title}"`);
+          break;
+        }
+      }
+    }
+
+    // 1e. Scan TITLE for US States (High Priority)
+    if (!extractedLocation) {
+      for (const state of ALL_STATES) {
+        const regex = new RegExp(`\\b${state.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+        if (regex.test(titleLower)) {
+          extractedLocation = state;
+          countryName = "United States";
+          countryCode = "USA";
+          logger.info(`[MATCHED] Rule-based extraction (State Scan - Title): ${extractedLocation} for "${title}"`);
+          break;
+        }
+      }
+    }
+
+    // 1f. Scan Categories for locations
+    if (!extractedLocation) {
+      for (const cat of categories) {
+        const isCity = MAJOR_CITIES.find(c => c.toLowerCase() === cat.toLowerCase());
+        const isCountry = FALLBACK_COUNTRIES.find(c => c.toLowerCase() === cat.toLowerCase());
+        if (isCity || isCountry) {
+          extractedLocation = cat;
+          if (isCountry) {
+            countryName = isCountry;
+            countryCode = COUNTRY_MAP[isCountry] || "";
+          } else if (isCity) {
+            countryCode = CITY_TO_COUNTRY_CODE[isCity] || "";
+          }
+          logger.info(`[MATCHED] RSS Category: ${extractedLocation} for "${title}"`);
+          break;
+        }
+      }
+    }
+
+    // 1g. Pattern: "Location: Headline" or "Location - Headline"
+    if (!extractedLocation) {
+      const prefixMatch = title.match(/^([^:|-]{3,20})[:|-]\s/);
+      if (prefixMatch) {
+        const potentialLoc = prefixMatch[1].trim();
+        const isCity = MAJOR_CITIES.find(c => c.toLowerCase() === potentialLoc.toLowerCase());
+        const isCountry = FALLBACK_COUNTRIES.find(c => c.toLowerCase() === potentialLoc.toLowerCase());
+        const isState = ALL_STATES.find(s => s.toLowerCase() === potentialLoc.toLowerCase());
+        
+        if (isCity || isCountry || isState) {
+          extractedLocation = potentialLoc;
+          if (isCountry) {
+            countryName = isCountry;
+            countryCode = COUNTRY_MAP[isCountry] || "";
+          } else if (isCity) {
+            countryCode = CITY_TO_COUNTRY_CODE[isCity] || "";
+          } else if (isState) {
+            countryName = "United States";
+            countryCode = "USA";
+          }
+          logger.info(`[MATCHED] Rule-based extraction (Prefix): ${extractedLocation} for "${title}"`);
+        }
+      }
+    }
+
+    // 1h. Scan DESCRIPTION for countries (Fallback)
+    if (!extractedLocation) {
+      for (const country of FALLBACK_COUNTRIES) {
+        const regex = new RegExp(`\\b${country.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+        if (regex.test(desc.toLowerCase())) {
+          extractedLocation = country;
+          countryName = country;
+          countryCode = COUNTRY_MAP[country] || "";
+          logger.info(`[MATCHED] Rule-based extraction (Country Scan - Desc): ${extractedLocation} for "${title}"`);
+          break;
+        }
+      }
+    }
+
+    // 1i. Scan DESCRIPTION for major cities (Fallback)
+    if (!extractedLocation) {
+      for (const city of MAJOR_CITIES) {
+        const regex = new RegExp(`\\b${city.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+        if (regex.test(desc.toLowerCase())) {
+          extractedLocation = city;
+          countryCode = CITY_TO_COUNTRY_CODE[city] || "";
+          logger.info(`[MATCHED] Rule-based extraction (City Scan - Desc): ${extractedLocation} for "${title}"`);
+          break;
+        }
+      }
+    }
+
+    // 1j. Scan DESCRIPTION for US States (Fallback)
+    if (!extractedLocation) {
+      for (const state of ALL_STATES) {
+        const regex = new RegExp(`\\b${state.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+        if (regex.test(desc.toLowerCase())) {
+          extractedLocation = state;
+          countryName = "United States";
+          countryCode = "USA";
+          logger.info(`[MATCHED] Rule-based extraction (State Scan - Desc): ${extractedLocation} for "${title}"`);
+          break;
+        }
+      }
+    }
+
+    if (!extractedLocation) {
+      extractedLocation = "Global";
+    }
+
+    if (extractedLocation === "Global") {
+      processedIds.current.add(rawItem.id);
+      return null;
+    }
 
     try {
-      let locationName = "Global";
-      let countryCode = "";
-      let countryName = "";
-      try {
-        const parsed = JSON.parse(locationResult.text);
-        locationName = parsed.location || "Global";
-        countryCode = parsed.countryCode || "";
-        countryName = parsed.countryName || "";
-      } catch (e) {
-        console.error("Failed to parse Gemini response", e);
-      }
-
-      // If location is Global but we have a country, use the country for geocoding
-      const geocodeQuery = (locationName === "Global" && countryName && countryName !== "Global") 
-        ? countryName 
-        : locationName;
-
+      // 3. Geocoding
+      const geocodeQuery = (extractedLocation === "Global" && countryName && countryName !== "Global") ? countryName : extractedLocation;
       if (!geocodeQuery || geocodeQuery === "Global") {
         processedIds.current.add(rawItem.id);
         return null;
       }
 
-      // 2. Geocode with backend
       const geoRes = await fetch(`/api/geocode?q=${encodeURIComponent(geocodeQuery)}`);
       
-      if (geoRes.status === 404) {
-        console.log(`Location not found for "${geocodeQuery}", marking as processed.`);
-        processedIds.current.add(rawItem.id);
-        return null;
-      }
-
       if (!geoRes.ok) {
-        console.warn(`Geocoding temporary failure for "${geocodeQuery}" (Status: ${geoRes.status}). Will retry later.`);
+        if (geoRes.status === 404) {
+          logger.warn(`Location not found for: ${geocodeQuery}`);
+          processedIds.current.add(rawItem.id);
+        } else {
+          logger.error(`Geocoding API error (${geoRes.status}) for: ${geocodeQuery}`);
+        }
         return null;
       }
 
       const geo = await geoRes.json();
       
-      // Use the geocoder's display name if it's more descriptive, but keep it concise
-      let descriptiveLocation = (locationName && locationName !== "Global") ? locationName : (countryName && countryName !== "Global" ? countryName : (geo.displayName || "Global"));
-      
-      if (geo.displayName && locationName && locationName !== "Global") {
+      // Refine descriptive location
+      let descriptiveLocation = extractedLocation;
+      if (geo.displayName) {
         const parts = geo.displayName.split(',').map((p: string) => p.trim());
-        // If the geocoder returned more info than just the country, use it
         if (parts.length > 1) {
-          // Take up to 3 parts (e.g., City, State, Country)
           descriptiveLocation = parts.slice(0, 3).join(', ');
         }
       }
 
+      // Ensure pubDate is valid
+      const pubDate = rawItem.pubDate || new Date().toISOString();
+      const dateObj = new Date(pubDate);
+      const timestamp = isNaN(dateObj.getTime()) ? Date.now() : dateObj.getTime();
+
       const enrichedItem: NewsItem = {
         ...rawItem,
         locationName: descriptiveLocation,
-        countryCode,
-        countryName,
+        countryCode: countryCode || "",
+        countryName: countryName || "Global",
         lat: geo.lat,
         lng: geo.lng,
-        timestamp: new Date(rawItem.pubDate).getTime()
+        timestamp: timestamp
       };
 
       processedIds.current.add(rawItem.id);
       processedTitles.current.add(normalizedTitle);
       return enrichedItem;
     } catch (error) {
-      console.error("Error processing news item:", error);
+      logger.error("Error geocoding news item:", error);
       return null;
     }
   };
@@ -163,14 +284,27 @@ export default function App() {
   const isProcessingRef = useRef(false);
 
   const fetchAndProcessNews = async () => {
-    if (isProcessingRef.current) return;
+    logger.info("Starting news fetch and process cycle...");
+    if (isProcessingRef.current) {
+      logger.debug("Already processing, skipping this cycle.");
+      return;
+    }
     isProcessingRef.current = true;
     setIsProcessing(true);
     
     try {
       // 1. Fetch fresh RSS
       const res = await fetch('/api/news-rss');
+      if (!res.ok) {
+        throw new Error(`RSS API returned ${res.status}: ${await res.text()}`);
+      }
+      
       const rawItems = await res.json();
+      if (!Array.isArray(rawItems)) {
+        throw new Error("RSS API did not return an array of items");
+      }
+      
+      logger.info(`Fetched ${rawItems.length} news items from RSS.`);
       
       const newItems: NewsItem[] = [];
       // Filter for items not in cache (by ID or Title)
@@ -179,41 +313,56 @@ export default function App() {
         return !processedIds.current.has(item.id) && !processedTitles.current.has(normalizedTitle);
       }).slice(0, 50);
       
+      logger.info(`Processing ${unprocessed.length} new items...`);
+      setProcessingCount({ current: 0, total: unprocessed.length });
+      
+      let currentIdx = 0;
       for (const item of unprocessed) {
+        currentIdx++;
+        setProcessingCount({ current: currentIdx, total: unprocessed.length });
+        
+        // Add a small delay before Gemini call to be gentler on the API
+        await new Promise(resolve => setTimeout(resolve, 500));
+        
         const enriched = await processNewsItem(item);
-        if (enriched) newItems.push(enriched);
-        // Small delay to avoid hitting rate limits too hard (Nominatim 1 req/sec)
+        if (enriched) {
+          newItems.push(enriched);
+          logger.debug(`Successfully processed: ${enriched.title} (${enriched.locationName})`);
+          
+          // Update UI incrementally so user sees progress
+          setNews(prev => {
+            const combined = [enriched, ...prev];
+            const unique = combined.filter((item, index, self) => 
+              index === self.findIndex((t) => t.id === item.id || t.title.trim().toLowerCase() === item.title.trim().toLowerCase())
+            );
+            return unique.slice(0, 5000);
+          });
+
+          // Save to DB immediately too
+          fetch('/api/news', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify([enriched])
+          }).catch(err => logger.error("Failed to save item to DB", err));
+        }
+        
+        // Wait for geocoding rate limit (Nominatim is 1 req/sec)
         await new Promise(resolve => setTimeout(resolve, 1100));
       }
 
       if (newItems.length > 0) {
-        // 2. Save new items to backend cache
-        await fetch('/api/news', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(newItems)
-        });
-
-        setNews(prev => {
-          const combined = [...newItems, ...prev];
-          const unique = combined.filter((item, index, self) => 
-            index === self.findIndex((t) => t.id === item.id || t.title.trim().toLowerCase() === item.title.trim().toLowerCase())
-          );
-          
-          // Increase limit to 5000 to keep more history
-          return unique.slice(0, 5000);
-        });
-
+        logger.info(`Finished processing batch. Added ${newItems.length} new items.`);
         if (autoZoomRef.current && newItems.length > 0) {
           setSelectedNewsId(newItems[0].id);
         }
         setLastUpdated(Date.now());
       }
     } catch (error) {
-      console.error("Failed to fetch/process news:", error);
+      logger.error("Failed to fetch/process news:", error);
     } finally {
       isProcessingRef.current = false;
       setIsProcessing(false);
+      setProcessingCount({ current: 0, total: 0 });
     }
   };
 
@@ -228,9 +377,16 @@ export default function App() {
             processedIds.current.add(item.id);
             processedTitles.current.add(item.title.trim().toLowerCase());
           });
+          logger.info(`Loaded ${cachedNews.length} items from cache.`);
+        } else {
+          // If cache is empty, it might have been cleared. Reset our local tracking.
+          logger.info("Cache is empty. Resetting local tracking.");
+          processedIds.current.clear();
+          processedTitles.current.clear();
+          setNews([]);
         }
       } catch (e) {
-        console.error("Initial fetch failed", e);
+        logger.error("Initial fetch failed", e);
       }
       // After initial cache fetch, do a fresh RSS check
       fetchAndProcessNews();
@@ -240,6 +396,35 @@ export default function App() {
     const interval = setInterval(fetchAndProcessNews, 60000);
     return () => clearInterval(interval);
   }, []);
+
+  const [showFlushConfirm, setShowFlushConfirm] = useState(false);
+
+  const flushDatabase = async () => {
+    logger.info("Flushing database...");
+    try {
+      const res = await fetch('/api/news/flush', { method: 'POST' });
+      if (res.ok) {
+        logger.info("Database flushed on server.");
+        processedIds.current.clear();
+        processedTitles.current.clear();
+        setNews([]);
+        logger.info("Local state cleared.");
+        setShowFlushConfirm(false);
+        
+        // Reset processing flag to allow immediate re-fetch
+        isProcessingRef.current = false;
+        setIsProcessing(false);
+        
+        // Re-fetch news after flush
+        logger.info("Triggering fresh fetch after flush...");
+        fetchAndProcessNews();
+      } else {
+        logger.error("Failed to flush database on server:", await res.text());
+      }
+    } catch (e) {
+      logger.error("Failed to flush database", e);
+    }
+  };
 
   const agencies = Array.from(new Set(news.map(item => item.source))).sort();
   const countries: string[] = news
@@ -254,35 +439,37 @@ export default function App() {
     return item?.countryName || code;
   };
 
-  const filteredNews = news.filter(item => {
-    const matchesTopic = item.title.toLowerCase().includes(filterTopic.toLowerCase()) ||
-                        item.source.toLowerCase().includes(filterTopic.toLowerCase());
-    
-    if (!matchesTopic) return false;
+  const filteredNews = useMemo(() => {
+    return news.filter(item => {
+      const matchesTopic = item.title.toLowerCase().includes(filterTopic.toLowerCase()) ||
+                          item.source.toLowerCase().includes(filterTopic.toLowerCase());
+      
+      if (!matchesTopic) return false;
 
-    if (agencyFilter !== 'all' && item.source !== agencyFilter) return false;
-    
-    if (countryFilter !== 'all' && item.countryCode !== countryFilter) return false;
+      if (agencyFilter !== 'all' && item.source !== agencyFilter) return false;
+      
+      if (countryFilter !== 'all' && item.countryCode !== countryFilter) return false;
 
-    if (timeFilter === 'all') return true;
-    
-    const now = Date.now();
-    const itemTime = item.timestamp;
-    const diffHours = (now - itemTime) / (1000 * 60 * 60);
+      if (timeFilter === 'all') return true;
+      
+      const now = Date.now();
+      const itemTime = item.timestamp;
+      const diffHours = (now - itemTime) / (1000 * 60 * 60);
 
-    // Handle potential future dates from clock skew or timezone issues
-    // We allow up to 24 hours in the "future" to account for significant clock offsets
-    if (diffHours < -24) return false; 
+      // Handle potential future dates from clock skew or timezone issues
+      // We allow up to 24 hours in the "future" to account for significant clock offsets
+      if (diffHours < -24) return false; 
 
-    if (timeFilter === '1h') return diffHours <= 1;
-    if (timeFilter === '6h') return diffHours <= 6;
-    if (timeFilter === '24h') return diffHours <= 24;
-    if (timeFilter === '48h') return diffHours <= 48;
-    if (timeFilter === '7d') return diffHours <= 24 * 7;
-    if (timeFilter === 'custom') return diffHours <= 24 * customDays;
-    
-    return true;
-  });
+      if (timeFilter === '1h') return diffHours <= 1;
+      if (timeFilter === '6h') return diffHours <= 6;
+      if (timeFilter === '24h') return diffHours <= 24;
+      if (timeFilter === '48h') return diffHours <= 48;
+      if (timeFilter === '7d') return diffHours <= 24 * 7;
+      if (timeFilter === 'custom') return diffHours <= 24 * customDays;
+      
+      return true;
+    }).sort((a, b) => b.timestamp - a.timestamp);
+  }, [news, filterTopic, agencyFilter, countryFilter, timeFilter, customDays]);
 
   return (
     <div className="flex flex-col h-screen bg-zinc-950 text-zinc-100 font-sans overflow-hidden">
@@ -299,19 +486,36 @@ export default function App() {
           {isProcessing && (
             <div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-orange-500 animate-pulse">
               <Loader2 size={12} className="animate-spin" />
-              Live Processing
+              Live Processing {processingCount.total > 0 ? `(${processingCount.current}/${processingCount.total})` : ''}
             </div>
           )}
           
-          <div className="h-8 w-[1px] bg-zinc-800 mx-2" />
-
-          <button 
-            onClick={() => setShowSettings(!showSettings)}
-            className={`flex items-center gap-2 px-4 py-2 rounded-full text-[11px] font-bold uppercase tracking-wider transition-all border ${showSettings ? 'bg-orange-600 border-orange-500 text-white shadow-lg shadow-orange-900/40' : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:border-zinc-700 hover:text-zinc-200'}`}
-          >
-            <Filter size={14} />
-            {showSettings ? 'Close Controls' : 'Control Center'}
-          </button>
+          <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 mr-2">
+              <span className="text-zinc-500 text-[9px] uppercase font-bold tracking-widest">Logs:</span>
+              <button
+                onClick={() => setLogLevel(logLevel === 'debug' ? 'error' : 'debug')}
+                className={`px-2 py-1 rounded text-[9px] font-bold uppercase transition-all border ${logLevel === 'debug' ? 'bg-orange-600/10 border-orange-500/50 text-orange-500' : 'bg-zinc-900 border-zinc-800 text-zinc-500 hover:text-zinc-400'}`}
+              >
+                {logLevel}
+              </button>
+            </div>
+            <button
+              onClick={() => fetchAndProcessNews()}
+              disabled={isProcessing}
+              className="px-3 py-1 bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 text-[10px] font-bold uppercase tracking-wider rounded border border-zinc-700 transition-colors"
+            >
+              Refresh News
+            </button>
+            <div className="h-8 w-[1px] bg-zinc-800 mx-2" />
+            <button 
+              onClick={() => setShowSettings(!showSettings)}
+              className={`flex items-center gap-2 px-4 py-2 rounded-full text-[11px] font-bold uppercase tracking-wider transition-all border ${showSettings ? 'bg-orange-600 border-orange-500 text-white shadow-lg shadow-orange-900/40' : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:border-zinc-700 hover:text-zinc-200'}`}
+            >
+              <Filter size={14} />
+              {showSettings ? 'Close Controls' : 'Control Center'}
+            </button>
+          </div>
         </div>
 
         {/* Unified Control Center Overlay */}
@@ -391,6 +595,32 @@ export default function App() {
                         onChange={(e) => setCustomDays(parseInt(e.target.value))}
                         className="w-full accent-orange-500 h-1 bg-zinc-800 rounded-full appearance-none cursor-pointer"
                       />
+                    </div>
+                  )}
+                </div>
+
+                <div className="pt-4 border-t border-zinc-800">
+                  {!showFlushConfirm ? (
+                    <button
+                      onClick={() => setShowFlushConfirm(true)}
+                      className="w-full py-2 bg-red-950/30 hover:bg-red-900/50 text-red-500 text-[10px] font-bold uppercase tracking-widest rounded-lg border border-red-900/50 transition-all"
+                    >
+                      Flush Database
+                    </button>
+                  ) : (
+                    <div className="flex gap-2">
+                      <button
+                        onClick={flushDatabase}
+                        className="flex-1 py-2 bg-red-600 hover:bg-red-500 text-white text-[10px] font-bold uppercase tracking-widest rounded-lg transition-all shadow-lg shadow-red-900/40"
+                      >
+                        Confirm Flush
+                      </button>
+                      <button
+                        onClick={() => setShowFlushConfirm(false)}
+                        className="px-3 py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-400 text-[10px] font-bold uppercase tracking-widest rounded-lg border border-zinc-700 transition-all"
+                      >
+                        Cancel
+                      </button>
                     </div>
                   )}
                 </div>
