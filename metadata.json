@@ -1,0 +1,5 @@
+{
+  "name": "GeoNews Real-Time",
+  "description": "A real-time geographic news visualizer using Google News and Google Maps.",
+  "requestFramePermissions": ["geolocation"]
+}
